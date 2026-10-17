@@ -29,7 +29,8 @@ behavior, relevant source/contract and the checks you ran. Discuss new formats,
 dependency coupling or large shared abstractions before implementation. Existing
 commands, package names and published product formats remain compatibility
 commitments. Elevation's initial Apollo products remain scratch; imagery's
-publication reporting and end-to-end orchestrator are still planned work.
+publication reporting remains planned work. Its end-to-end `run` command and
+the Earth RGB pyramid workflows are available in the imagery CLI.
 
 Do not commit raw downloads, generated tile trees, credentials or local paths.
 Small examples use temporary outputs; persistent products and evidence use

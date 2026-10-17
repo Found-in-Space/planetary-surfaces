@@ -14,7 +14,7 @@ from typing import Any, BinaryIO
 
 from PIL import Image
 
-from .processing import ProcessingError
+from .processing import ProcessingError, _validate_display_bands
 from .project import TextureProject
 from .provenance import producer_identity
 from .toolchain import gdalinfo, require_tools, run_command, tool_versions
@@ -52,7 +52,7 @@ def _tile_path(project: TextureProject, zoom: int, x: int, y: int) -> Path:
     return Path(project.product.path_template.format(z=zoom, x=x, y=y))
 
 
-def _inspect_png(path: Path, *, tile_size: int) -> dict[str, Any]:
+def _inspect_png(path: Path, *, tile_size: int, channels="grayscale") -> dict[str, Any]:
     payload = path.read_bytes()
     if not payload.startswith(_PNG_SIGNATURE):
         raise ProcessingError(f"tile is not a PNG: {path}")
@@ -110,12 +110,13 @@ def _inspect_png(path: Path, *, tile_size: int) -> dict[str, Any]:
         raise ProcessingError(f"PNG is missing required chunks: {path}")
     if (width, height) != (tile_size, tile_size):
         raise ProcessingError(f"tile must be {tile_size} x {tile_size} pixels: {path}")
-    if (bit_depth, color_type, interlace) != (8, 0, 0):
+    expected_color_type = 2 if channels == "rgb" else 0
+    if (bit_depth, color_type, interlace) != (8, expected_color_type, 0):
         raise ProcessingError(
-            f"tile must be non-interlaced opaque 8-bit grayscale: {path}"
+            f"tile must be non-interlaced opaque 8-bit {channels}: {path}"
         )
     if "PLTE" in chunks:
-        raise ProcessingError(f"grayscale tile must not contain a palette: {path}")
+        raise ProcessingError(f"display tile must not contain a palette: {path}")
     return {
         "sha256": hashlib.sha256(payload).hexdigest(),
         "size_bytes": len(payload),
@@ -128,16 +129,11 @@ def _inspect_png(path: Path, *, tile_size: int) -> dict[str, Any]:
 
 
 def _validate_level_raster(
-    metadata: dict[str, Any], dimension: int, path: Path
+    metadata: dict[str, Any], dimension: int, path: Path, channels="grayscale"
 ) -> None:
     if metadata.get("size") != [dimension, dimension]:
         raise ProcessingError(f"level raster has unexpected dimensions: {path}")
-    bands = metadata.get("bands")
-    if not isinstance(bands, list) or len(bands) != 1:
-        raise ProcessingError(f"level raster must have one band: {path}")
-    band = bands[0]
-    if not isinstance(band, dict) or band.get("type") != "Byte":
-        raise ProcessingError(f"level raster must contain Byte pixels: {path}")
+    _validate_display_bands(metadata, channels)
 
 
 def _level_inputs(project: TextureProject, work_root: Path) -> list[dict[str, Any]]:
@@ -148,7 +144,7 @@ def _level_inputs(project: TextureProject, work_root: Path) -> list[dict[str, An
             raise ProcessingError(f"level raster does not exist: {path}")
         dimension = project.product.tile_size * (1 << zoom)
         metadata, _ = gdalinfo(path)
-        _validate_level_raster(metadata, dimension, path)
+        _validate_level_raster(metadata, dimension, path, project.product.channels)
         levels.append(
             {
                 "zoom": zoom,
@@ -273,13 +269,19 @@ def _retile_level(
     for x in range(matrix):
         for y in range(matrix):
             source = discovered[(x, y)]
-            details = _inspect_png(source, tile_size=project.product.tile_size)
+            details = _inspect_png(
+                source,
+                tile_size=project.product.tile_size,
+                channels=project.product.channels,
+            )
             relative = _tile_path(project, zoom, x, y)
             destination = staging / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists():
                 existing = _inspect_png(
-                    destination, tile_size=project.product.tile_size
+                    destination,
+                    tile_size=project.product.tile_size,
+                    channels=project.product.channels,
                 )
                 if existing["sha256"] != details["sha256"]:
                     raise ProcessingError(
@@ -337,7 +339,7 @@ def emit_tiles(
         ],
         "png": {
             "bit_depth": 8,
-            "color_type": 0,
+            "color_type": 2 if project.product.channels == "rgb" else 0,
             "zlevel": _PNG_ZLEVEL,
             "opaque": True,
         },
@@ -410,9 +412,13 @@ def emit_tiles(
             config = project.base_texture
             base = work_root / config.path
             with Image.open(base) as image:
-                if image.mode != "L" or image.size != (config.width, config.height):
+                if (
+                    image.mode != project.product.image_mode
+                    or image.size != (config.width, config.height)
+                    or "transparency" in image.info
+                ):
                     raise ProcessingError(
-                        "Base texture dimensions or grayscale encoding changed"
+                        "Base texture dimensions or opaque display encoding changed"
                     )
             shutil.copyfile(base, staging / config.path)
             base_texture = {
@@ -477,6 +483,20 @@ def emit_tiles(
                     "id": source.id,
                     "sha256": source.acquisition.expected.sha256,
                     "size_bytes": source.acquisition.expected.size_bytes,
+                    "title": source.acquisition.title,
+                    "landing_page": source.acquisition.landing_page,
+                    "url": source.acquisition.url,
+                    "citation": source.acquisition.citation,
+                    **(
+                        {"license": source.acquisition.license}
+                        if source.acquisition.license
+                        else {}
+                    ),
+                    **(
+                        {"license_url": source.acquisition.license_url}
+                        if source.acquisition.license_url
+                        else {}
+                    ),
                 }
                 for source in project.sources
             ],
@@ -580,18 +600,22 @@ def _read_exact(stream: BinaryIO, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def _decode_opaque_tile(path: Path, tile_size: int) -> tuple[bytes, str, int]:
-    details = _inspect_png(path, tile_size=tile_size)
+def _decode_opaque_tile(
+    path: Path, tile_size: int, channels="grayscale"
+) -> tuple[bytes, str, int]:
+    details = _inspect_png(path, tile_size=tile_size, channels=channels)
+    bands = 3 if channels == "rgb" else 1
+    mode = "RGB" if channels == "rgb" else "L"
     with Image.open(path) as image:
-        if image.format != "PNG" or image.mode != "L":
-            raise ProcessingError(f"tile must decode as grayscale PNG: {path}")
+        if image.format != "PNG" or image.mode != mode:
+            raise ProcessingError(f"tile must decode as {channels} PNG: {path}")
         if image.size != (tile_size, tile_size):
             raise ProcessingError(f"decoded tile dimensions are invalid: {path}")
         if "transparency" in image.info:
             raise ProcessingError(f"decoded tile declares transparency: {path}")
         image.load()
         pixels = image.tobytes()
-    if len(pixels) != tile_size * tile_size:
+    if len(pixels) != tile_size * tile_size * bands:
         raise ProcessingError(f"decoded tile byte count is invalid: {path}")
     return pixels, details["sha256"], details["size_bytes"]
 
@@ -635,7 +659,8 @@ def _validate_level_tiles(
             f"z{zoom} tile paths mismatch: missing={missing}, extra={extra}"
         )
 
-    required_space = level["dimension"] ** 2 + 1_000_000_000
+    bands = project.product.band_count
+    required_space = level["dimension"] ** 2 * bands + 1_000_000_000
     available = shutil.disk_usage(work_root).free
     if available < required_space:
         raise ProcessingError(
@@ -665,8 +690,10 @@ def _validate_level_tiles(
         actual_digest = hashlib.sha256()
         tile_bytes = 0
         with pgm.open("rb") as source_pixels:
-            if _read_pgm_token(source_pixels) != b"P5":
-                raise ProcessingError(f"validation raster is not binary PGM: {pgm}")
+            if _read_pgm_token(source_pixels) != (b"P6" if bands == 3 else b"P5"):
+                raise ProcessingError(
+                    f"validation raster has the wrong binary PNM encoding: {pgm}"
+                )
             width = int(_read_pgm_token(source_pixels))
             height = int(_read_pgm_token(source_pixels))
             maximum = int(_read_pgm_token(source_pixels))
@@ -681,17 +708,19 @@ def _validate_level_tiles(
                 for tile_x in range(matrix):
                     relative = _tile_path(project, zoom, tile_x, tile_y)
                     tile = output_root / relative
-                    pixels, checksum, size_bytes = _decode_opaque_tile(tile, tile_size)
+                    pixels, checksum, size_bytes = _decode_opaque_tile(
+                        tile, tile_size, project.product.channels
+                    )
                     if checksum != manifest[relative.as_posix()]:
                         raise ProcessingError(f"tile checksum mismatch: {relative}")
                     tile_row.append(pixels)
                     tile_bytes += size_bytes
                 for local_y in range(tile_size):
-                    start = local_y * tile_size
+                    start = local_y * tile_size * bands
                     actual = b"".join(
-                        pixels[start : start + tile_size] for pixels in tile_row
+                        pixels[start : start + tile_size * bands] for pixels in tile_row
                     )
-                    expected = _read_exact(source_pixels, level["dimension"])
+                    expected = _read_exact(source_pixels, level["dimension"] * bands)
                     actual_digest.update(actual)
                     expected_digest.update(expected)
                     if actual != expected:
@@ -712,7 +741,7 @@ def _validate_level_tiles(
             "tile_bytes": tile_bytes,
             "manifest_sha256": product_level["manifest_sha256"],
             "pixel_sha256": actual_digest.hexdigest(),
-            "all_tiles_opaque_grayscale": True,
+            f"all_tiles_opaque_{project.product.channels}": True,
             "exact_streaming_reconstruction": True,
             "horizontal_adjacencies_covered": matrix * (matrix - 1),
             "vertical_adjacencies_covered": matrix * (matrix - 1),
@@ -762,19 +791,9 @@ def validate_tiles(
         )
     identity_hash = identity_sha256(identity)
     state_path = work_root / "state" / "validate-tiles.json"
-    prior = _read_json(state_path)
     report_path = evidence_root / "tiles.validation.json"
-    if (
-        prior
-        and prior.get("status") == "complete"
-        and prior.get("identity_sha256") == identity_hash
-        and report_path.is_file()
-        and sha256_file(report_path) == prior.get("report_sha256")
-    ):
-        report = _read_json(report_path)
-        if report is None:
-            raise ProcessingError(f"validation report is invalid: {report_path}")
-        return report
+    # A matching descriptor and old report cannot authenticate current tile
+    # bytes. Explicit validation always reads the payload, including on resume.
 
     state: dict[str, Any] = {
         "format_version": 1,
@@ -807,7 +826,11 @@ def validate_tiles(
             if sha256_file(path) != sha256_file(work_root / config.path):
                 raise ProcessingError("Base texture differs from its recorded build")
             with Image.open(path) as image:
-                if image.mode != "L" or image.size != (config.width, config.height):
+                if (
+                    image.mode != project.product.image_mode
+                    or image.size != (config.width, config.height)
+                    or "transparency" in image.info
+                ):
                     raise ProcessingError("Base texture dimensions or encoding changed")
         product_levels_raw = product.get("levels")
         if not isinstance(product_levels_raw, list):
@@ -856,7 +879,7 @@ def validate_tiles(
                 "tile_size": project.product.tile_size,
                 "opaque": True,
                 "pixel_type": "uint8",
-                "channels": "grayscale",
+                "channels": project.product.channels,
                 "missing_pixel": project.missing_pixel,
                 "bounds": project.product.bounds,
             },

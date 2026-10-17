@@ -79,10 +79,16 @@ build-levels
 emit-tiles
 validate-tiles
 validate-project
+acquire-project
+admit-source
+run
 ```
 
-Publication reporting and an end-to-end orchestrator remain to be implemented.
-See
+`run` preflights and orchestrates the same restartable production stages,
+snapshots the exact definition and lockfile, and validates the complete tile
+tree. `acquire-project` downloads and inspects all declared sources without
+admitting candidates; `admit-source` records a source only after explicit review.
+Richer publication reporting remains separate. See
 [`docs/implementation-plan.md`](docs/implementation-plan.md) for the phased
 handoff.
 
@@ -133,6 +139,17 @@ introduced here.
 The [six-site Apollo recipes](projects/moon/APOLLO_IMAGERY.md) add matching
 context and registered NAC detail for Apollo 12, 14, 15, 16 and 17, and collect
 them with the existing Apollo 11 tiles behind one validated runtime descriptor.
+
+## Earth day and night products
+
+The [Blue Marble and Black Marble workflow](projects/earth/README.md) provides
+matching format 2 RGB products: NASA's unshaded July 2004 Blue Marble base map
+and Black Marble 2016 colour composite. Each recipe declares all eight 500 m
+source sheets, a complete 256-pixel zoom 0–9 Mercator pyramid and a separate
+4096 × 2048 full-latitude base. The source specifications pin complete payload
+hashes admitted after acquisition and metadata review. The workflow includes
+source admission, disk planning, reproducible build commands and publication
+handoff; it does not upload payloads or alter runtime lighting.
 
 ## Licence
 

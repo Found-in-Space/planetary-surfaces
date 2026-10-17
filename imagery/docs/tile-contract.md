@@ -128,3 +128,11 @@ equirectangular base. Its caps use the full-latitude base and zero reference
 height outside the streamed latitude extent. New products need new immutable
 prefixes and cache identities; neither descriptor edits nor filename changes
 constitute reprojection. Existing format 1 releases remain geographic.
+
+Format 2 display products also support `tiles.channels: "rgb"`: opaque 8-bit
+RGB PNG (colour type 2), with Red/Green/Blue channel order. The independent base
+uses the same channels. Grayscale remains colour type 0. Alpha, palette and
+`tRNS` transparency remain prohibited. Valid black samples, including the
+declared opaque missing-coverage value, participate in pyramid averaging;
+the produced levels and PNGs do not mark black as nodata. These are display
+samples: an RGB night composite does not declare physical radiance or emission.

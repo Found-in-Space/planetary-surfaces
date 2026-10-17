@@ -1,0 +1,24 @@
+format_version = 1
+status = "admitted"
+source_id = "earth-black-marble-2016-500m-a2"
+title = "NASA Black Marble 2016 A2"
+landing_page = "https://science.nasa.gov/earth/earth-observatory/earth-at-night/maps/"
+url = "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/imagerecords/144000/144898/BlackMarble_2016_A2_geo.tif"
+filename = "BlackMarble_2016_A2_geo.tif"
+citation = "NASA Earth Observatory; Joshua Stevens, using Suomi NPP VIIRS data from Miguel Roman (NASA/GSFC), Black Marble 2016."
+source_crs = "../../../../resources/crs/earth-wgs84.wkt"
+license = "NASA imagery reuse terms; acknowledge source; no implied endorsement."
+license_url = "https://www.nasa.gov/nasa-brand-center/images-and-media/"
+
+[expected]
+size_bytes = 171407332
+sha256 = "55b5b0e035c66566c190b780b58fd4a3676c02c7297bb4b33d5b4f3fc6ec9474"
+width = 21600
+height = 21600
+band_count = 3
+geo_transform = [-180.0, 0.0041666666666667, 0.0, 0.0, 0.0, -0.0041666666666667]
+data_type = "Byte"
+nodata = "absent"
+mask_flags = ["ALL_VALID"]
+scale = "absent"
+offset = "absent"

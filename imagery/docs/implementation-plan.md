@@ -38,8 +38,9 @@ and a full pyramid rebuild are not publication gates for display textures.
 
 Status: source inspection, preflight, maximum-level reprojection,
 direct-from-base lower-level construction, opaque tile emission, and exact
-streaming validation are implemented. Rich publication reporting and the
-`run` orchestrator remain.
+streaming validation are implemented. The `run` orchestrator now snapshots the
+definition and lockfile and invokes these same stages through validation.
+Rich publication reporting remains.
 
 Build a small projected lunar source and a zoom 0–2 product exercising the real
 pipeline. The fixture must contain unmistakable north/south/east/west markers,
@@ -64,6 +65,13 @@ input checksums, output checksums, start/end times, status, and diagnostic
 paths. State must become complete only after atomic output promotion.
 
 ## Phase 3: multiple-source proof
+
+Status: compatible-raster `mosaic` and `priority` composition are implemented,
+including RGB production and exact streaming RGB validation. The eight-sheet
+synthetic Earth case checks sheet registration, valid black, polar fallback,
+admission, resume and overlap rejection. The Blue/Black Marble recipes declare
+full 500 m source sheets, acquired and admitted by exact SHA-256 and reviewed
+metadata on 17 October 2026. Their production builds use those pinned inputs.
 
 Add a second synthetic source with partial coverage and deliberate overlap.
 Prove at least `priority` compositing and one explicit regional/cutline case.
@@ -127,5 +135,4 @@ an evolving series.
 - Manifest granularity for tens of thousands of objects.
 - Canonical JSON and configuration identity rules.
 - Published object-store prefix and immutability controls.
-- Whether later colour products use RGB PNG, another lossless format, or a new
-  version of the consumer contract.
+- Future colour encodings beyond the format 2 opaque RGB PNG contract.

@@ -111,6 +111,16 @@ admission, grid/cache incompatibility, mesh elevation UVs, and measured crop
 bounds with both Terrarium and RG16 heights. These checks use only tiny local
 synthetic sources. Full payload and Quest acceptance remain separate steps.
 
+## Earth RGB pyramids
+
+`test_earth_marbles.py` parses both real recipes and builds an eight-sheet,
+synthetic WGS 84 RGB globe through explicit admission and the full `run` command
+path. It checks the independent base against analytically averaged source
+pixels (including valid black), RGB channel order, opaque encoding, exact
+tile reconstruction, unchanged completed raster reuse and overlap rejection.
+No large NASA source files or network access are required. These tests do not
+establish visual acceptance of the full historical NASA composites.
+
 ## Matched overlay validation
 
 `test_photometry.py` checks robust gain/offset recovery with outliers, rejection

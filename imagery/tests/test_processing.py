@@ -95,6 +95,9 @@ def test_preflight_reports_candidate_as_not_ready(
 
     assert report["ready_for_processing"] is False
     assert report["estimate"]["tile_count"] == 21
+    assert report["estimate"]["minimum_working_budget_bytes"] == (
+        1024**2 + 2 * (256**2 + 512**2 + 1024**2)
+    )
     assert (tmp_path / "evidence-root/preflight.json").is_file()
 
 

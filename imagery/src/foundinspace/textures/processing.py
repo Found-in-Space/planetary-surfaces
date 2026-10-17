@@ -226,6 +226,8 @@ def preflight(
             )
 
     require_tools(("gdalinfo", "gdalwarp", "gdal_translate", "gdal_retile.py", "proj"))
+    if len(project.sources) > 1:
+        require_tools(("gdalbuildvrt",))
     validate_grid_crs(project)
     source_checks: list[dict[str, Any]] = []
     for source in project.sources:
@@ -252,17 +254,21 @@ def preflight(
             }
         )
     dimension = project.product.maximum_dimension
-    base_bytes = dimension * dimension
+    bands = project.product.band_count
+    base_bytes = dimension * dimension * bands
     pyramid_bytes = sum(
-        (project.product.tile_size * (1 << zoom)) ** 2
+        (project.product.tile_size * (1 << zoom)) ** 2 * bands
         for zoom in range(project.product.maximum_zoom + 1)
     )
     overview_bytes = (
-        project.base_texture.width * project.base_texture.height
+        project.base_texture.width * project.base_texture.height * bands
         if project.base_texture
         else 0
     )
-    minimum_budget = base_bytes + pyramid_bytes + 2 * overview_bytes
+    # Work levels, encoded tiles and one base-sized temporary. Atomic raster
+    # construction, retile resume and validation exports run sequentially, so
+    # their temporary allocations do not need to be reserved simultaneously.
+    minimum_budget = base_bytes + 2 * pyramid_bytes + 2 * overview_bytes
     work_root.parent.mkdir(parents=True, exist_ok=True)
     disk = shutil.disk_usage(work_root.parent)
     producer = producer_identity()
@@ -385,37 +391,51 @@ def _run_atomic_file_stage(
         raise
 
 
-def _processing_contract(project: TextureProject) -> tuple[SourceRef, AcquisitionSpec]:
-    if len(project.sources) != 1 or project.composite_policy != "priority":
+def _processing_contract(project: TextureProject) -> tuple[SourceRef, ...]:
+    if project.composite_policy not in {"priority", "mosaic"}:
         raise ProcessingError(
-            "the initial processor supports one source with priority compositing"
+            "the processor supports priority or compatible-raster mosaic compositing"
         )
-    source_ref = project.sources[0]
-    spec = source_ref.acquisition
-    if spec.status != "admitted" or not spec.expected.complete:
-        raise ProcessingError(f"source {spec.source_id} has not been admitted")
-    if spec.source_crs is None or not spec.source_crs.is_file():
-        raise ProcessingError(
-            f"source {spec.source_id} needs a reviewed source_crs file"
-        )
-    return source_ref, spec
+    for source in project.sources:
+        spec = source.acquisition
+        if spec.status != "admitted" or not spec.expected.complete:
+            raise ProcessingError(f"source {spec.source_id} has not been admitted")
+        if spec.source_crs is None or not spec.source_crs.is_file():
+            raise ProcessingError(
+                f"source {spec.source_id} needs a reviewed source_crs file"
+            )
+        if (
+            spec.expected.band_count != project.product.band_count
+            or spec.expected.data_type != "Byte"
+        ):
+            raise ProcessingError(
+                "Source bands must match the declared display channels"
+            )
+    # GDAL's mosaic precedence is last valid source wins, independent of TOML order.
+    return tuple(
+        sorted(project.sources, key=lambda source: (source.priority, source.id))
+    )
+
+
+def _validate_display_bands(metadata: dict[str, Any], channels: str) -> None:
+    expected = ["Red", "Green", "Blue"] if channels == "rgb" else ["Gray"]
+    bands = metadata.get("bands", [])
+    if len(bands) != len(expected) or any(
+        band.get("type") != "Byte"
+        or band.get("colorInterpretation") not in {None, colour}
+        for band, colour in zip(bands, expected, strict=True)
+    ):
+        raise ProcessingError(f"Raster must contain opaque Byte {channels} bands")
 
 
 def _validate_level_output(
-    metadata: dict[str, Any], *, dimension: int, bounds=None
+    metadata: dict[str, Any], *, dimension: int, bounds=None, channels="grayscale"
 ) -> None:
     if metadata.get("size") != [dimension, dimension]:
         raise ProcessingError(
             f"generated level must be {dimension} x {dimension} pixels"
         )
-    bands = metadata.get("bands")
-    if not isinstance(bands, list) or len(bands) != 1:
-        raise ProcessingError("generated level must contain exactly one band")
-    band = bands[0]
-    if not isinstance(band, dict) or band.get("type") != "Byte":
-        raise ProcessingError("generated level band must use GDAL Byte type")
-    if band.get("colorInterpretation") not in {None, "Gray"}:
-        raise ProcessingError("generated level band must be grayscale")
+    _validate_display_bands(metadata, channels)
     if bounds is not None:
         west, south, east, north = bounds
         expected = [
@@ -509,7 +529,9 @@ def _build_base_texture(project, source_path, spec, identity, work_root, environ
         "-r",
         config.resampling,
         "-dstnodata",
-        str(project.missing_pixel),
+        "None",
+        "-wo",
+        f"INIT_DEST={project.missing_pixel}",
     ]
     if spec.expected.nodata != "absent":
         argv.extend(("-srcnodata", str(spec.expected.nodata)))
@@ -522,29 +544,150 @@ def _build_base_texture(project, source_path, spec, identity, work_root, environ
         work_root=work_root,
         environment=environment,
         validate_output=lambda metadata: _validate_base_texture(
-            metadata, config.width, config.height
+            metadata, config.width, config.height, project.product.channels
         ),
     )
     _run_atomic_file_stage(
         stage_name="encode-base-texture",
         identity={**base_identity, "overview_sha256": sha256_file(overview)},
-        argv=["gdal_translate", "-of", "PNG", str(overview), "{output}"],
+        argv=[
+            "gdal_translate",
+            "-of",
+            "PNG",
+            "-a_nodata",
+            "none",
+            str(overview),
+            "{output}",
+        ],
         output_path=work_root / config.path,
         work_root=work_root,
         environment=environment,
         validate_output=lambda metadata: _validate_base_texture(
-            metadata, config.width, config.height
+            metadata, config.width, config.height, project.product.channels
         ),
     )
 
 
-def _validate_base_texture(metadata, width, height):
-    if (
-        metadata.get("size") != [width, height]
-        or len(metadata.get("bands", [])) != 1
-        or metadata["bands"][0].get("type") != "Byte"
+def _validate_base_texture(metadata, width, height, channels="grayscale"):
+    if metadata.get("size") != [width, height]:
+        raise ProcessingError("Base texture dimensions changed")
+    _validate_display_bands(metadata, channels)
+
+
+def _prepare_sources(project, source_root, work_root, environment):
+    sources = _processing_contract(project)
+    records = []
+    paths = []
+    for source in sources:
+        spec = source.acquisition
+        path = source_root.resolve() / spec.filename
+        metadata, command = gdalinfo(path)
+        checksum = sha256_file(path)
+        observed, errors, srs_commands = _source_observation(
+            spec, path, metadata, size=path.stat().st_size, checksum=checksum
+        )
+        if errors:
+            raise ProcessingError(
+                "source does not match the admitted contract: " + "; ".join(errors)
+            )
+        _validate_display_bands(metadata, project.product.channels)
+        records.append(
+            {
+                "id": source.id,
+                "sha256": checksum,
+                "observed": observed,
+                "inspect_command": list(command.argv),
+                "spatial_reference_commands": srs_commands,
+                "source_crs_sha256": sha256_file(spec.source_crs),
+            }
+        )
+        paths.append(path)
+    first = sources[0].acquisition
+    if len(paths) == 1:
+        return paths[0], first, records
+
+    reference = records[0]["observed"]
+    for record in records[1:]:
+        observed = record["observed"]
+        if any(
+            observed[key] != reference[key]
+            for key in ("source_crs_proj4", "nodata_values", "scales", "offsets")
+        ):
+            raise ProcessingError(
+                "Mosaic sources must share CRS, nodata, scale and offset"
+            )
+        if any(
+            not math.isclose(
+                observed["geo_transform"][index],
+                reference["geo_transform"][index],
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+            for index in (1, 2, 4, 5)
+        ):
+            raise ProcessingError(
+                "Mosaic sources must share pixel size and orientation"
+            )
+    if any(
+        record["observed"]["geo_transform"][index] != 0
+        for record in records
+        for index in (2, 4)
     ):
-        raise ProcessingError("Base texture dimensions or grayscale encoding changed")
+        raise ProcessingError("Mosaics require north-up, unrotated source rasters")
+    if project.composite_policy == "mosaic":
+        # Adjacent NASA sheets may have sub-pixel georeferencing roundoff.
+        # Real overlap must use the explicitly ordered priority policy.
+        bounds = []
+        for record in records:
+            observed = record["observed"]
+            west, dx, _, north, _, dy = observed["geo_transform"]
+            if dx <= 0 or dy >= 0:
+                raise ProcessingError(
+                    "Mosaics require eastward columns and southward rows"
+                )
+            current = (
+                west,
+                north + dy * observed["height"],
+                west + dx * observed["width"],
+                north,
+            )
+            for other in bounds:
+                if (
+                    min(current[2], other[2]) - max(current[0], other[0]) > dx * 1e-4
+                    and min(current[3], other[3]) - max(current[1], other[1])
+                    > -dy * 1e-4
+                ):
+                    raise ProcessingError(
+                        "Mosaic sources overlap; declare priority compositing"
+                    )
+            bounds.append(current)
+    mosaic = work_root.resolve() / "sources.vrt"
+    argv = ["gdalbuildvrt", "-overwrite", "-resolution", "highest"]
+    if first.expected.nodata == "absent":
+        argv.extend(("-srcnodata", "None", "-vrtnodata", "None"))
+    argv.extend(("{output}", *(str(path) for path in paths)))
+
+    def validate_mosaic(metadata):
+        _validate_display_bands(metadata, project.product.channels)
+        dependencies = {Path(path).resolve() for path in metadata.get("files", [])}
+        if not {path.resolve() for path in paths} <= dependencies:
+            raise ProcessingError("GDAL mosaic omitted a declared source")
+
+    _run_atomic_file_stage(
+        stage_name="mosaic-sources",
+        identity={
+            "project": project.semantic_dict(),
+            "sources": records,
+            "tools": tool_versions(),
+            "producer": producer_identity(),
+        },
+        argv=argv,
+        output_path=mosaic,
+        work_root=work_root.resolve(),
+        environment=environment,
+        validate_output=validate_mosaic,
+    )
+    return mosaic, first, records
 
 
 def build_base(
@@ -557,22 +700,15 @@ def build_base(
 ) -> dict[str, Any]:
     if threads <= 0 or warp_memory_mb <= 0:
         raise ValueError("threads and warp_memory_mb must be > 0")
-    _, spec = _processing_contract(project)
-    source_path = source_root.resolve() / spec.filename
-    size = source_path.stat().st_size
-    checksum = sha256_file(source_path)
-    source_metadata, inspect_command = gdalinfo(source_path)
-    source_observed, source_errors, srs_commands = _source_observation(
-        spec,
-        source_path,
-        source_metadata,
-        size=size,
-        checksum=checksum,
+    temporary_root = work_root.resolve() / "tmp"
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    environment = {
+        "CPL_TMPDIR": str(temporary_root),
+        "GDAL_CACHEMAX": str(warp_memory_mb),
+    }
+    source_path, spec, source_records = _prepare_sources(
+        project, source_root, work_root, environment
     )
-    if source_errors:
-        raise ProcessingError(
-            "source does not match the admitted contract: " + "; ".join(source_errors)
-        )
     target_crs_checksum = sha256_file(project.target.crs_path)
     source_crs_checksum = sha256_file(spec.source_crs)
     validate_grid_crs(project)
@@ -603,7 +739,9 @@ def build_base(
         "-r",
         project.product.reprojection_resampling,
         "-dstnodata",
-        str(project.missing_pixel),
+        "None",
+        "-wo",
+        f"INIT_DEST={project.missing_pixel}",
         "-wm",
         str(warp_memory_mb),
         "-wo",
@@ -624,14 +762,9 @@ def build_base(
     if spec.expected.nodata != "absent":
         argv.extend(("-srcnodata", str(spec.expected.nodata)))
     argv.extend((str(source_path), "{output}"))
-    temporary_root = work_root.resolve() / "tmp"
-    temporary_root.mkdir(parents=True, exist_ok=True)
     identity = {
         "project": project.semantic_dict(),
-        "source_sha256": checksum,
-        "source_observed": source_observed,
-        "source_inspect_command": list(inspect_command.argv),
-        "source_spatial_reference_commands": srs_commands,
+        "sources": source_records,
         "source_crs_sha256": source_crs_checksum,
         "target_crs_sha256": target_crs_checksum,
         "tools": tool_versions(),
@@ -645,11 +778,12 @@ def build_base(
         argv=argv,
         output_path=output,
         work_root=work_root.resolve(),
-        environment={"CPL_TMPDIR": str(temporary_root)},
+        environment=environment,
         validate_output=lambda metadata: _validate_level_output(
             metadata,
             dimension=dimension,
             bounds=project.projected_bounds if project.grid else None,
+            channels=project.product.channels,
         ),
     )
 
@@ -660,7 +794,7 @@ def build_base(
             spec,
             identity,
             work_root.resolve(),
-            {"CPL_TMPDIR": str(temporary_root), "GDAL_PAM_ENABLED": "NO"},
+            {**environment, "GDAL_PAM_ENABLED": "NO"},
         )
     return state
 
@@ -723,6 +857,7 @@ def build_levels(project: TextureProject, *, work_root: Path) -> list[dict[str, 
                         metadata,
                         dimension=dimension,
                         bounds=project.projected_bounds if project.grid else None,
+                        channels=project.product.channels,
                     )
                 ),
             )

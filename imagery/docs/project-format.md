@@ -79,6 +79,14 @@ is used only while mapping admitted source pixels onto the maximum-resolution
 target grid. `pyramid_resampling` is used to derive each lower level directly
 from that base, and is fixed to area averaging (`average`) in format version 1.
 
+Optional `license` and `license_url` fields record source terms alongside the
+required citation; the URL must be public HTTPS. These fields participate in
+the semantic identity and are carried into generated product metadata.
+`acquire-project` downloads and inspects every source without admitting it.
+After reviewing the inspection evidence, `admit-source` rechecks the local file
+and updates the selected source specification with complete expected metadata
+and SHA-256. Changed existing expectations are rejected.
+
 ## Target definitions
 
 Targets are reusable across products, but a product pins the exact checked-in
@@ -137,8 +145,22 @@ The old format rejects these new tables rather than silently ignoring them.
 The independent equirectangular base spans ±180°, ±90°, and is averaged from
 the original admitted source, rather than from a clipped Mercator tile. Its CRS
 resource hash, dimensions, resampling and payload hash participate in generated
-build/product identity. It is opaque grayscale in the current processor. The
+build/product identity. Its opaque channels match the product's declared
+`channels`: `grayscale` or, in format 2, `rgb`. The
 base and polar display do not represent scientific heights.
+
+Format 1 remains grayscale. Format 2 RGB sources contain exactly three Byte
+bands in Red/Green/Blue order, and tiles use PNG colour type 2 with no alpha,
+palette or transparency chunk. No colour transform is implied by `rgb`.
+
+The processor supports single-source and compatible multi-source `priority`
+and `mosaic` products. Multiple sources must share CRS, pixel size/orientation,
+nodata, scale and offset; they are assembled into a VRT before reprojection.
+`mosaic` rejects real overlap (sub-pixel georeferencing roundoff is tolerated).
+For `priority`, the highest numeric priority wins; source ID breaks ties
+lexicographically, with the last valid source winning. A changed source order
+in the TOML does not change this precedence. See the eight-sheet Earth examples
+at [`projects/earth/`](../projects/earth/README.md).
 
 ## Matched overlay projects
 

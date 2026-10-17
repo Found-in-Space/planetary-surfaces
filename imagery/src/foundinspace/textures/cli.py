@@ -397,7 +397,7 @@ def build_levels_command(project_path: Path, work_root: Path) -> None:
 )
 @_command_errors
 def emit_tiles_command(project_path: Path, work_root: Path, output_root: Path) -> None:
-    """Copy every aligned level window into opaque grayscale PNG tiles."""
+    """Copy every aligned level window into opaque display PNG tiles."""
     _emit(
         emit_tiles(
             load_project(project_path),
@@ -438,5 +438,80 @@ def validate_tiles_command(
             work_root=work_root,
             output_root=output_root,
             evidence_root=evidence_root,
+        )
+    )
+
+
+@cli.command("acquire-project")
+@click.argument(
+    "project_path", type=click.Path(exists=True, dir_okay=False, path_type=Path)
+)
+@click.option(
+    "--source-root", required=True, type=click.Path(file_okay=False, path_type=Path)
+)
+@click.option(
+    "--evidence-root", required=True, type=click.Path(file_okay=False, path_type=Path)
+)
+@_command_errors
+def acquire_project_command(project_path: Path, source_root: Path, evidence_root: Path):
+    """Download and inspect every declared source; candidates remain unadmitted."""
+    from .workflow import acquire_project
+
+    _emit(acquire_project(load_project(project_path), source_root, evidence_root))
+
+
+@cli.command("admit-source")
+@click.argument(
+    "acquisition_path", type=click.Path(exists=True, dir_okay=False, path_type=Path)
+)
+@click.option(
+    "--source-root",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--evidence-root", required=True, type=click.Path(file_okay=False, path_type=Path)
+)
+@_command_errors
+def admit_source_command(
+    acquisition_path: Path, source_root: Path, evidence_root: Path
+):
+    """After reviewing inspection evidence, update this source's versioned contract."""
+    from .workflow import admit_source
+
+    _emit(admit_source(load_acquisition(acquisition_path), source_root, evidence_root))
+
+
+@cli.command("run")
+@click.argument(
+    "project_path", type=click.Path(exists=True, dir_okay=False, path_type=Path)
+)
+@_root_options
+@click.option("--threads", default=1, show_default=True, type=click.IntRange(min=1))
+@click.option(
+    "--warp-memory-mb", default=512, show_default=True, type=click.IntRange(min=1)
+)
+@_command_errors
+def run_project_command(
+    project_path: Path,
+    source_root: Path,
+    work_root: Path,
+    output_root: Path,
+    evidence_root: Path,
+    threads: int,
+    warp_memory_mb: int,
+):
+    """Preflight, build the full pyramid, emit tiles and validate every pixel."""
+    from .workflow import run_project
+
+    _emit(
+        run_project(
+            load_project(project_path),
+            source_root=source_root,
+            work_root=work_root,
+            output_root=output_root,
+            evidence_root=evidence_root,
+            threads=threads,
+            warp_memory_mb=warp_memory_mb,
         )
     )

@@ -48,6 +48,8 @@ _ACQUISITION_KEYS = {
     "url",
     "filename",
     "citation",
+    "license",
+    "license_url",
     "source_crs",
     "expected",
     "reported",
@@ -122,9 +124,11 @@ class AcquisitionSpec:
     source_crs: Path | None
     expected: ExpectedSource
     reported: dict[str, Any]
+    license: str | None = None
+    license_url: str | None = None
 
     def semantic_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "format_version": FORMAT_VERSION,
             "status": self.status,
             "source_id": self.source_id,
@@ -141,6 +145,11 @@ class AcquisitionSpec:
             "expected": asdict(self.expected),
             "reported": self.reported,
         }
+        if self.license is not None:
+            result["license"] = self.license
+        if self.license_url is not None:
+            result["license_url"] = self.license_url
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +182,14 @@ class ProductConfig:
     format: str
     opaque: bool
     path_template: str
+
+    @property
+    def band_count(self) -> int:
+        return 3 if self.channels == "rgb" else 1
+
+    @property
+    def image_mode(self) -> str:
+        return "RGB" if self.channels == "rgb" else "L"
 
     @property
     def maximum_dimension(self) -> int:
@@ -409,6 +426,12 @@ def load_acquisition(path: Path) -> AcquisitionSpec:
         source_crs=source_crs,
         expected=expected,
         reported=reported,
+        license=_string(raw, "license", "source acquisition")
+        if "license" in raw
+        else None,
+        license_url=_https_url(raw, "license_url", "source acquisition")
+        if "license_url" in raw
+        else None,
     )
 
 
@@ -550,13 +573,16 @@ def load_project(path: Path) -> TextureProject:
         raise ValueError("product.reprojection_resampling is not supported")
     if product.pyramid_resampling != "average":
         raise ValueError("product.pyramid_resampling must be average")
-    if (product.pixel_type, product.channels, product.format, product.opaque) != (
-        "uint8",
-        "grayscale",
-        "png",
-        True,
+    allowed_channels = {"grayscale", "rgb"} if format_version == 2 else {"grayscale"}
+    if (
+        product.pixel_type != "uint8"
+        or product.channels not in allowed_channels
+        or product.format != "png"
+        or not product.opaque
     ):
-        raise ValueError("the v1 product must be opaque uint8 grayscale PNG")
+        raise ValueError(
+            "products require opaque uint8 grayscale PNG; format 2 also supports RGB"
+        )
     if product.path_template != "imagery/{z}/{x}/{y}.png":
         raise ValueError("the v1 path template must be imagery/{z}/{x}/{y}.png")
     expected_bounds = (

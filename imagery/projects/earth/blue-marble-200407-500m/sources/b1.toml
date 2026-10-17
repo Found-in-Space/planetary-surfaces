@@ -1,0 +1,24 @@
+format_version = 1
+status = "admitted"
+source_id = "earth-blue-marble-200407-500m-b1"
+title = "NASA Blue Marble July 2004 B1"
+landing_page = "https://science.nasa.gov/earth/earth-observatory/blue-marble-next-generation/base-map/"
+url = "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/july/world.200407.3x21600x21600.B1_geo.tif"
+filename = "world.200407.3x21600x21600.B1_geo.tif"
+citation = "NASA Earth Observatory; Reto Stoeckli (NASA/GSFC), Blue Marble: Next Generation, July 2004."
+source_crs = "../../../../resources/crs/earth-wgs84.wkt"
+license = "NASA imagery reuse terms; acknowledge source; no implied endorsement."
+license_url = "https://www.nasa.gov/nasa-brand-center/images-and-media/"
+
+[expected]
+size_bytes = 314704904
+sha256 = "a86e2ad26c61df40a3fce573ee35d0cac446c5e435758ed440dd1cb4061b7cef"
+width = 21600
+height = 21600
+band_count = 3
+geo_transform = [-90.0000000000005, 0.004166666667, 0.0, 90.0000000000002, 0.0, -0.004166666667]
+data_type = "Byte"
+nodata = "absent"
+mask_flags = ["ALL_VALID"]
+scale = "absent"
+offset = "absent"
