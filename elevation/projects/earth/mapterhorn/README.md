@@ -75,7 +75,7 @@ UV_CACHE_DIR=.cache/uv uv run python -m foundinspace.terrain.mapterhorn acquire 
 # acquisition identity before selecting it as a controlled input.
 UV_CACHE_DIR=.cache/uv uv run python -m foundinspace.terrain.mapterhorn build \
   <immutable-source>/planet.pmtiles <immutable-source>/source-manifest.json \
-  --output <durable-run>/prepared
+  --output <durable-run>/prepared --workers 2 --max-in-flight 4
 
 UV_CACHE_DIR=.cache/uv uv run python -m foundinspace.terrain.mapterhorn validate \
   <immutable-source>/planet.pmtiles <durable-run>/prepared/earth.pmtiles \
@@ -100,6 +100,27 @@ leaves are emitted in bounded groups. Payloads are not deduplicated; their disk
 size may exceed a deduplicated source significantly. The archive is valid v3
 with an ordered index and an explicitly false `clustered` flag.
 
+`build --workers N --max-in-flight M` controls CPU conversion. Defaults are two
+workers and twice the worker count in flight (four with the default workers).
+`--workers 1` converts inline without process startup or prefetch; its default
+in-flight limit is one. Both options require positive integers. An explicit
+limit smaller than the worker count is valid and may leave workers idle.
+
+Workers receive only a source tile ID and its WebP bytes and return four sorted
+PNG children. Processes use `spawn` on every platform, including macOS and Linux;
+source readers, the archive stream and SQLite stay in the parent. No additional
+system or container dependency is required beyond the locked elevation runtime.
+Programmatic multiprocess callers must use an importable main module with the
+usual `if __name__ == "__main__":` guard; the module CLI already does this.
+
+The window counts all submitted source tiles until the parent has written their
+children, including results completed out of order. A slow early tile closes
+the window; later completions cannot trigger more reads. Source entries/runs
+remain lazy, and tile payloads are identical across worker counts. Memory scales
+with the selected window and workers, not archive length. This is a tile-count
+bound, not a configurable byte or total-process-RAM ceiling. Conversion workers
+may be underused when an early tile is slow or parent IO is limiting throughput.
+
 Source `(z,x,y)` splits into `(z+1,2x+dx,2y+dy)`. `dx=0` is west and `dy=0`
 north. Every scalar sample and negative value is preserved. Output z0 uses an
 independent 2 × 2 arithmetic mean of decoded source-z0 heights in float64,
@@ -113,6 +134,41 @@ changed source or producer identities. Recovery also handles interruption after
 archive completion but before validation and descriptor placement. Do not
 modify the code or lock while resuming. A fresh implementation needs a fresh
 run directory.
+
+Execution settings (`workers`, resolved `maxInFlight`, `startMethod` and the
+128-source-tile checkpoint interval) are recorded in `recipe.json`,
+`provenance.json` and the archive's build identity. Recipe version 2 binds them
+to both partial and completed-archive recovery. Resume with the same settings;
+changing them or resuming a version-1 build requires a fresh output directory.
+Different settings preserve tile bytes and payload ordering but deliberately
+change archive metadata and therefore the whole-archive hash.
+
+Only complete source tiles advance the contiguous checkpoint. A worker failure,
+Ctrl-C or parent write failure cancels queued tasks and waits for bounded running
+work before closing the packer. Resume truncates bytes after the last durable
+checkpoint and redoes that uncommitted batch, including any partial child group.
+`product.json` is still placed only after final archive validation.
+
+## Small local conversion benchmark
+
+Use an authenticated small sample, such as the probe's read-only 16-source-tile
+extract. Keep the sample, its manifest, reports and machine details outside Git:
+
+```sh
+UV_CACHE_DIR=.cache/uv uv run python examples/benchmark_mapterhorn.py \
+  <sample>/sample-source.pmtiles <sample>/sample-source-manifest.json \
+  --output <scratch>/benchmark.json --hardware '<CPU and RAM>' \
+  --sample-tiles 16 --passes 16 --trials 3 --workers 1 2 4
+```
+
+Each trial repeats at most 16 source tiles through one fresh conversion pool
+and verifies an identical ordered payload digest across trials/worker counts.
+Use `--passes 1` separately to expose startup overhead for a tiny invocation.
+The report records each duration, throughput, code/source identity and actual
+execution settings. Timings include parent reads, IPC, PNG encoding, startup,
+shutdown and ordered hashing. They exclude archive writing, fsync, z0 generation
+and final validation. Warm repeated geographic samples do not predict global
+runtime, cold-source IO, peak memory or output capacity.
 
 ## Validation and review bundle
 

@@ -1,5 +1,12 @@
 import io
 import json
+import multiprocessing
+import os
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -11,6 +18,8 @@ from foundinspace.terrain.encoding import decode_terrarium, encode_terrarium
 from foundinspace.terrain.mapterhorn import (
     acquire,
     build,
+    converted_tiles,
+    execution_settings,
     split_tile,
     validate,
     zoom_zero,
@@ -20,6 +29,7 @@ from foundinspace.terrain.pmtiles_archive import (
     RangeSource,
     check_structure,
     local_archive,
+    tile_entries,
 )
 
 
@@ -225,9 +235,297 @@ def test_build_resumes_after_archive_completion_before_descriptor(
         build(path, manifest, output)
     assert (output / "earth.pmtiles").exists()
     assert not (output / "product.json").exists()
+    with pytest.raises(ValueError, match="different build"):
+        build(path, manifest, output, workers=1)
+    assert not (output / "product.json").exists()
     monkeypatch.setattr(module, "validate", original_validate)
     product = build(path, manifest, output)
     assert product["transport"]["sha256"] == digest(output / "earth.pmtiles")
+
+
+def archive_payloads(path):
+    with local_archive(path) as reader:
+        h = reader.header()
+        return [
+            (
+                entry.tile_id,
+                reader.get_bytes(h["tile_data_offset"] + entry.offset, entry.length),
+            )
+            for entry in tile_entries(reader)
+        ]
+
+
+def test_worker_counts_preserve_payload_bytes_order_and_execution_receipts(tmp_path):
+    path, manifest, _ = source(tmp_path)
+    expected = None
+    for workers, limit in [(1, 1), (2, 1), (2, 4), (3, 5)]:
+        output = tmp_path / f"product-{workers}-{limit}"
+        build(path, manifest, output, workers=workers, max_in_flight=limit)
+        payloads = archive_payloads(output / "earth.pmtiles")
+        if expected is None:
+            expected = payloads
+        assert payloads == expected
+        # Payload section order, not just directory sorting, is deterministic.
+        with local_archive(output / "earth.pmtiles") as reader:
+            entries = list(tile_entries(reader))
+            assert [e.offset for e in entries] == sorted(e.offset for e in entries)
+            identity = reader.metadata()["buildIdentity"]
+        execution = execution_settings(workers, limit)
+        assert identity["execution"] == execution
+        for name in ("recipe.json", "provenance.json"):
+            assert json.loads((output / name).read_text())["execution"] == execution
+
+
+@pytest.mark.parametrize("limit", [1, 3, 5])
+def test_slow_first_tile_bounds_inputs_and_completed_results(monkeypatch, limit):
+    """Gate completion deterministically; real spawn is covered by builds above."""
+    import foundinspace.terrain.mapterhorn as module
+
+    release_first = threading.Event()
+    later_finished = threading.Event()
+    consumed = []
+    written = []
+    completion_order = []
+    state = {"completed": 0}
+
+    def inputs():
+        for tile_id in range(11):
+            assert len(consumed) - len(written) < limit
+            consumed.append(tile_id)
+            yield tile_id, b"payload"
+
+    def conversion(tile_id, _payload):
+        if tile_id == 0:
+            assert release_first.wait(10)
+        completion_order.append(tile_id)
+        state["completed"] += 1
+        if state["completed"] == limit - 1:
+            later_finished.set()
+        return [(tile_id, b"converted")]
+
+    def pool(*, max_workers, mp_context, initializer):
+        assert mp_context.get_start_method() == "spawn"
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+    monkeypatch.setattr(module, "ProcessPoolExecutor", pool)
+    monkeypatch.setattr(module, "convert_tile", conversion)
+
+    def consume():
+        with closing(
+            converted_tiles(inputs(), workers=5, max_in_flight=limit)
+        ) as tiles:
+            for tile_id, children in tiles:
+                assert children == [(tile_id, b"converted")]
+                written.append(tile_id)
+
+    with ThreadPoolExecutor(max_workers=1) as consumer:
+        future = consumer.submit(consume)
+        try:
+            if limit > 1:
+                assert later_finished.wait(10)
+                assert consumed == list(range(limit))
+                assert written == []
+                assert len(completion_order) == limit - 1
+        finally:
+            release_first.set()
+        future.result(timeout=10)
+    assert written == list(range(11))
+    if limit > 1:
+        assert completion_order.index(0) == limit - 1
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_single_in_flight_does_not_prefetch_and_one_worker_is_inline(
+    monkeypatch, workers
+):
+    import foundinspace.terrain.mapterhorn as module
+
+    if workers == 1:
+        monkeypatch.setattr(
+            module,
+            "ProcessPoolExecutor",
+            lambda **_kwargs: pytest.fail("Inline mode created a pool"),
+        )
+    consumed = []
+
+    def inputs():
+        for tile_id in range(4):
+            consumed.append(tile_id)
+            yield tile_id, webp(np.zeros((512, 512)))
+
+    with closing(converted_tiles(inputs(), workers=workers, max_in_flight=1)) as tiles:
+        assert next(tiles)[0] == 0
+        assert consumed == [0]
+    assert consumed == [0]
+
+
+@pytest.mark.parametrize(
+    "workers,limit",
+    [(0, 1), (-1, 1), (True, 1), (1.5, 1), (1, 0), (2, -1), (2, False), (2, 1.5)],
+)
+def test_invalid_execution_settings_fail_before_input_or_output(
+    tmp_path, workers, limit
+):
+    output = tmp_path / "output"
+    with pytest.raises(ValueError, match="positive integer"):
+        build(
+            "missing-source",
+            "missing-manifest",
+            output,
+            workers=workers,
+            max_in_flight=limit,
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])
+def test_partial_child_write_rolls_back_to_contiguous_checkpoint(
+    tmp_path, monkeypatch, failure
+):
+    import foundinspace.terrain.mapterhorn as module
+
+    path, manifest, _ = source(tmp_path)
+    output = tmp_path / "product"
+    monkeypatch.setattr(module, "CHECKPOINT_SOURCE_TILES", 2)
+    original_add = DiskPacker.add
+    initial_children = set(multiprocessing.active_children())
+    writes = []
+
+    def interrupted_add(packer, tile_id, payload):
+        original_add(packer, tile_id, payload)
+        writes.append(tile_id)
+        # z0 and two complete source tiles are durable; the next tile is partial.
+        if len(writes) == 11:
+            raise failure("Interrupted child write")
+
+    monkeypatch.setattr(DiskPacker, "add", interrupted_add)
+    with pytest.raises(failure, match="Interrupted child write"):
+        build(path, manifest, output, workers=2, max_in_flight=3)
+    assert set(multiprocessing.active_children()) == initial_children
+    assert not (output / "earth.pmtiles").exists()
+    assert not (output / "product.json").exists()
+    with sqlite3.connect(output / "earth.work.sqlite") as db:
+        assert db.execute(
+            "SELECT value FROM state WHERE key='progress'"
+        ).fetchone() == ("1",)
+        assert db.execute("SELECT count(*) FROM tiles").fetchone() == (9,)
+        end = int(db.execute("SELECT value FROM state WHERE key='end'").fetchone()[0])
+    partial = output / "earth.pmtiles.part"
+    assert partial.stat().st_size > end
+    with pytest.raises(ValueError, match="different input or recipe"):
+        build(path, manifest, output, workers=3, max_in_flight=3)
+    assert partial.stat().st_size > end
+    monkeypatch.setattr(DiskPacker, "add", original_add)
+    build(path, manifest, output, workers=2, max_in_flight=3)
+    fresh = tmp_path / "fresh"
+    build(path, manifest, fresh, workers=2, max_in_flight=3)
+    assert (output / "earth.pmtiles").read_bytes() == (
+        fresh / "earth.pmtiles"
+    ).read_bytes()
+
+
+def test_worker_decode_error_does_not_publish_or_advance_checkpoint(tmp_path):
+    path, manifest, _ = source(tmp_path)
+    # Replace one stored WebP with invalid data, retaining the source index and
+    # refreshing its manifest so admission succeeds and a spawned worker fails.
+    with local_archive(path) as reader:
+        h = reader.header()
+        broken = list(tile_entries(reader))[2]
+    with path.open("r+b") as stream:
+        stream.seek(h["tile_data_offset"] + broken.offset)
+        stream.write(b"X" * broken.length)
+    receipt = json.loads(manifest.read_text())
+    receipt["sha256"] = digest(path)
+    write_json(manifest, receipt)
+    output = tmp_path / "product"
+    from PIL import UnidentifiedImageError
+
+    for _ in range(2):
+        with pytest.raises(UnidentifiedImageError):
+            build(path, manifest, output, workers=2, max_in_flight=4)
+        assert not (output / "product.json").exists()
+        with sqlite3.connect(output / "earth.work.sqlite") as db:
+            assert db.execute("SELECT count(*) FROM tiles").fetchone() == (0,)
+            assert (
+                db.execute("SELECT value FROM state WHERE key='progress'").fetchone()
+                is None
+            )
+
+
+def fail_once_conversion(tile_id, payload):
+    """Importable spawned-worker fault; its marker is test scratch, never input."""
+    from foundinspace.terrain.mapterhorn import convert_tile
+
+    marker = Path(os.environ["FIS_TEST_WORKER_FAULT"])
+    if tile_id == 3 and not marker.exists():
+        marker.write_text("fault injected")
+        raise RuntimeError("Transient worker failure")
+    return convert_tile(tile_id, payload)
+
+
+def test_spawned_worker_failure_resumes_from_last_complete_source_tile(
+    tmp_path, monkeypatch
+):
+    import foundinspace.terrain.mapterhorn as module
+
+    path, manifest, _ = source(tmp_path)
+    output = tmp_path / "product"
+    monkeypatch.setattr(module, "CHECKPOINT_SOURCE_TILES", 2)
+    monkeypatch.setenv("FIS_TEST_WORKER_FAULT", str(tmp_path / "worker-fault"))
+    monkeypatch.setattr(module, "convert_tile", fail_once_conversion)
+    with pytest.raises(RuntimeError, match="Transient worker failure"):
+        build(path, manifest, output, workers=2, max_in_flight=3)
+    assert not (output / "earth.pmtiles").exists()
+    assert not (output / "product.json").exists()
+    with sqlite3.connect(output / "earth.work.sqlite") as db:
+        assert db.execute(
+            "SELECT value FROM state WHERE key='progress'"
+        ).fetchone() == ("1",)
+        assert db.execute("SELECT count(*) FROM tiles").fetchone() == (9,)
+    original_inputs = module.source_tiles
+    resumed_ids = []
+
+    def observed_inputs(*args):
+        for tile_id, payload in original_inputs(*args):
+            resumed_ids.append(tile_id)
+            yield tile_id, payload
+
+    monkeypatch.setattr(module, "source_tiles", observed_inputs)
+    build(path, manifest, output, workers=2, max_in_flight=3)
+    with local_archive(path) as reader:
+        assert resumed_ids == [e.tile_id for e in tile_entries(reader) if e.tile_id > 1]
+    fresh = tmp_path / "fresh"
+    build(path, manifest, fresh, workers=2, max_in_flight=3)
+    assert (output / "earth.pmtiles").read_bytes() == (
+        fresh / "earth.pmtiles"
+    ).read_bytes()
+
+
+def test_source_iterator_expands_runs_lazily_and_resumes_inside_them(
+    tmp_path, monkeypatch
+):
+    from pmtiles.tile import Entry
+
+    import foundinspace.terrain.mapterhorn as module
+
+    reads = []
+
+    class Reader:
+        def get_bytes(self, offset, length):
+            reads.append((offset, length))
+            return b"webp"
+
+    def entries(_reader):
+        yield Entry(10, 3, 4, 1_000_000)
+        pytest.fail("Prefetched a later directory entry")
+
+    monkeypatch.setattr(module, "tile_entries", entries)
+    with closing(
+        module.source_tiles(Reader(), {"tile_data_offset": 100}, 12, tmp_path)
+    ) as tiles:
+        assert next(tiles) == (13, b"webp")
+        assert next(tiles) == (14, b"webp")
+        assert reads == [(103, 4), (103, 4)]
 
 
 def test_http_ranges_reject_full_responses_changed_etags_and_cached_corruption(

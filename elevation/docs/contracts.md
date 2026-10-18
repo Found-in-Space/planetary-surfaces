@@ -61,3 +61,11 @@ need explicit PMTiles loading, version admission and vertical-reference policy.
 Consumers must distinguish absent archive entries from present zero pixels;
 upstream's zero-filled missing pixels cannot be recovered as a measurement mask.
 The current workflow labels every product scratch and does not approve uploads.
+
+Earth conversion may use bounded spawn-based CPU workers. The parent alone owns
+source/archive IO and SQLite. A fixed window counts queued and completed results
+until their children are written in source/child tile-ID order. Only a contiguous
+prefix of complete source tiles is checkpointed. Worker counts do not change
+tile bytes; execution settings are recorded and included in restart identity,
+so retuning or changing producer code requires a fresh run directory. Descriptors
+remain gated by validation of the finished archive.

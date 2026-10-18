@@ -10,13 +10,18 @@ import importlib.metadata
 import io
 import json
 import math
+import multiprocessing
 import platform
 import shutil
+import signal
 import sqlite3
 import subprocess
 import time
 import urllib.request
 import zlib
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -37,6 +42,8 @@ from .pmtiles_archive import (
 
 URL = "https://download.mapterhorn.com/planet.pmtiles"
 UPSTREAM_SHA = "775663e9ca58c7fe741dbd53fbe4461cb73a9bb9"
+DEFAULT_WORKERS = 2
+CHECKPOINT_SOURCE_TILES = 128
 LOCATIONS = {
     "everest": (86.925, 27.988),
     "alps": (7.96, 46.58),
@@ -139,6 +146,94 @@ def zoom_zero(payload):
     return png(encode_terrarium(reduced))
 
 
+def execution_settings(workers, max_in_flight):
+    """Execution is part of restart identity, even though tile bytes are unchanged."""
+    if type(workers) is not int or workers < 1:
+        raise ValueError("workers must be a positive integer")
+    if max_in_flight is None:
+        max_in_flight = 2 * workers if workers > 1 else 1
+    if type(max_in_flight) is not int or max_in_flight < 1:
+        raise ValueError("max_in_flight must be a positive integer")
+    return {
+        "workers": workers,
+        "maxInFlight": max_in_flight,
+        "startMethod": "spawn" if workers > 1 else "inline",
+        "checkpointSourceTiles": CHECKPOINT_SOURCE_TILES,
+    }
+
+
+def source_tiles(reader, header, progress, output):
+    """Read one payload at a time in the parent, including expanded sparse runs."""
+    for entry in tile_entries(reader):
+        for tile_id in range(
+            max(entry.tile_id, progress + 1), entry.tile_id + entry.run_length
+        ):
+            if shutil.disk_usage(output).free < 2 * 1024**3:
+                raise ValueError(
+                    "Stopped before exhausting durable storage; resume after adding capacity"
+                )
+            yield (
+                tile_id,
+                reader.get_bytes(
+                    header["tile_data_offset"] + entry.offset, entry.length
+                ),
+            )
+
+
+def convert_tile(tile_id, payload):
+    """Picklable CPU-only task: no archive handles, paths or SQLite connections."""
+    return sorted(split_tile(*tileid_to_zxy(tile_id), payload))
+
+
+def worker_signals():
+    # The parent handles Ctrl-C and rolls back its uncommitted writes. Workers
+    # finish at most the bounded window instead of also raising KeyboardInterrupt.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def converted_tiles(inputs, *, workers, max_in_flight):
+    """Ordered sliding window bounded across queued AND completed conversions.
+
+    Refill only after the caller consumes a result. In particular, a slow first
+    tile holds the window closed even if every later task has already finished.
+    Use closing() at the call site so writer errors also cancel pending work.
+    """
+    settings = execution_settings(workers, max_in_flight)
+    if workers == 1:
+        for tile_id, payload in inputs:
+            yield tile_id, convert_tile(tile_id, payload)
+        return
+    pool = ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=worker_signals,
+    )
+    pending = deque()
+    try:
+        inputs = iter(inputs)
+        exhausted = False
+        while True:
+            while not exhausted and len(pending) < settings["maxInFlight"]:
+                item = next(inputs, None)
+                if item is None:
+                    exhausted = True
+                    break
+                tile_id, payload = item
+                pending.append((tile_id, pool.submit(convert_tile, tile_id, payload)))
+                del payload, item
+            if not pending:
+                break
+            tile_id, future = pending.popleft()
+            yield tile_id, future.result()
+            # Drop the consumed result before submitting another task; futures
+            # retain their returned PNGs even after result() has been called.
+            del future
+    finally:
+        for _, future in pending:
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
 def admit_source(reader):
     h = reader.header()
     if (h["min_zoom"], h["max_zoom"]) != (0, 12):
@@ -211,8 +306,11 @@ def descriptor(source, header, identity):
     }
 
 
-def build(source_path, manifest_path, output):
+def build(
+    source_path, manifest_path, output, *, workers=DEFAULT_WORKERS, max_in_flight=None
+):
     """Build from a SHA-bound local source, with per-batch durable restart state."""
+    execution = execution_settings(workers, max_in_flight)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     source = json.loads(Path(manifest_path).read_text())
@@ -225,7 +323,8 @@ def build(source_path, manifest_path, output):
     build_identity = {
         "sourceSha256": source["sha256"],
         "producer": identity,
-        "recipeVersion": 1,
+        "recipeVersion": 2,
+        "execution": execution,
     }
     archive = output / "earth.pmtiles"
     # A process may have completed the archive rename and stopped before
@@ -246,26 +345,23 @@ def build(source_path, manifest_path, output):
                 if base is None:
                     raise ValueError("Cannot generate output z0 without source z0")
                 packer.add(0, zoom_zero(base))
+                del base
             batch = 0
             last_tile_id = progress
-            for entry in tile_entries(reader):
-                for tile_id in range(
-                    max(entry.tile_id, progress + 1), entry.tile_id + entry.run_length
-                ):
-                    if shutil.disk_usage(output).free < 2 * 1024**3:
-                        raise ValueError(
-                            "Stopped before exhausting durable storage; resume after adding capacity"
-                        )
-                    payload = reader.get_bytes(
-                        source_header["tile_data_offset"] + entry.offset, entry.length
-                    )
-                    z, x, y = tileid_to_zxy(tile_id)
-                    for child_id, child in sorted(split_tile(z, x, y, payload)):
+            inputs = source_tiles(reader, source_header, progress, output)
+            with closing(
+                converted_tiles(
+                    inputs, workers=workers, max_in_flight=execution["maxInFlight"]
+                )
+            ) as converted:
+                for tile_id, children in converted:
+                    for child_id, child in children:
                         packer.add(child_id, child)
                     last_tile_id = tile_id
                     batch += 1
-                    if batch % 128 == 0:
+                    if batch % CHECKPOINT_SOURCE_TILES == 0:
                         packer.checkpoint(tile_id)
+                    del children, child
             packer.checkpoint(last_tile_id)
             packer.finish(
                 {**source_header, "tile_type": TileType.PNG, "max_zoom": 13},
@@ -301,6 +397,7 @@ def finish_build(source_path, source, output, identity, build_identity):
         {
             "createdUtc": now(),
             "buildIdentity": build_identity,
+            "execution": build_identity["execution"],
             "sourceHeader": json_header(source_header),
         },
     )
@@ -314,7 +411,8 @@ def finish_build(source_path, source, output, identity, build_identity):
             "sourceSha256": source["sha256"],
             "sourceManifest": "source-manifest.json",
             "outputArchive": "earth.pmtiles",
-            "command": "UV_CACHE_DIR=.cache/uv uv run python -m foundinspace.terrain.mapterhorn build <source> <source-manifest> --output <output>",
+            "command": "UV_CACHE_DIR=.cache/uv uv run python -m foundinspace.terrain.mapterhorn build <source> <source-manifest> --output <output> --workers <execution.workers> --max-in-flight <execution.maxInFlight>",
+            "execution": build_identity["execution"],
             "conversion": product["derivation"],
             "producer": identity,
             "sourceScope": source["kind"],
@@ -682,6 +780,17 @@ def main():
     creation.add_argument("source", type=Path)
     creation.add_argument("manifest", type=Path)
     creation.add_argument("--output", type=Path, required=True)
+    creation.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="CPU conversion processes (default: 2); 1 runs inline without a pool",
+    )
+    creation.add_argument(
+        "--max-in-flight",
+        type=int,
+        help="Maximum source tiles submitted but not written, including completed results (default: 2 * workers, or 1 inline)",
+    )
     checking = commands.add_parser("validate")
     checking.add_argument("source", type=Path)
     checking.add_argument("archive", type=Path)
@@ -693,7 +802,13 @@ def main():
     elif args.command == "acquire":
         result = acquire(args.inspection, args.output)
     elif args.command == "build":
-        result = build(args.source, args.manifest, args.output)
+        result = build(
+            args.source,
+            args.manifest,
+            args.output,
+            workers=args.workers,
+            max_in_flight=args.max_in_flight,
+        )
     else:
         result = validate(args.source, args.archive)
         write_json(args.output, result)
