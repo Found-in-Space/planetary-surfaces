@@ -9,7 +9,14 @@ description = "Controlled, reusable planetary elevation tile production"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
-dependencies = ["affine>=3", "numpy>=2.2", "pillow>=11", "rasterio>=1.5.2", "scipy>=1.15"]
+dependencies = [
+    "affine>=3",
+    "numpy>=2.2",
+    "pillow>=11",
+    "pmtiles==3.7.0",
+    "rasterio>=1.5.2",
+    "scipy>=1.15",
+]
 
 [project.scripts]
 fis-terrain = "foundinspace.terrain.cli:main"

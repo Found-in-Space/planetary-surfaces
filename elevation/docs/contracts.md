@@ -46,3 +46,18 @@ a descriptor is placed only after full validation. A dirty/local build remains
 scratch, and cannot serve as citable release evidence. Raw sources and tile
 payloads remain outside Git. Catalog publication requires pinned public code,
 source rights/references and independently recorded consumer acceptance.
+
+## Experimental Earth PMTiles contract
+
+`earth-elevation-pmtiles` version 1 is a separate descriptor produced by the
+[Mapterhorn workflow](../projects/earth/mapterhorn/README.md). It declares
+PMTiles v3 transport, PNG Terrarium payloads, 256-pixel tiles, sparse directory
+availability and an unresolved upstream vertical reference. EPSG:3857's
+6,378,137 m projection radius is a horizontal grid parameter. It is **not** a
+declaration that the source heights are above that sphere or the WGS84 ellipsoid.
+
+This descriptor does not replace `elevation-xyz` version 2. Existing consumers
+need explicit PMTiles loading, version admission and vertical-reference policy.
+Consumers must distinguish absent archive entries from present zero pixels;
+upstream's zero-filled missing pixels cannot be recovered as a measurement mask.
+The current workflow labels every product scratch and does not approve uploads.

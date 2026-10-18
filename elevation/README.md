@@ -18,6 +18,13 @@ and `validate`. A build retains `<output>.work` for resume and exposes its
 descriptor only after numeric validation succeeds. All initial outputs are
 marked scratch; publication is a separate catalogs handoff.
 
+The [Earth Mapterhorn workflow](projects/earth/mapterhorn/README.md) inspects
+the global archive through bounded HTTP ranges and prepares a separate,
+explicitly versioned Earth PMTiles descriptor. It preserves upstream heights
+and sparse coverage without assigning them a reference-sphere datum. Its probe
+produces a **sample**, not an upload candidate. Full acquisition and preparation
+require durable capacity for the source, the PNG derivative and the disk index.
+
 ## Small example and checks
 
 ```sh
